@@ -1,0 +1,165 @@
+#!/bin/sh
+
+# /etc/hotplug.d/dhcp/98-client-join-notification
+
+# --- Конфигурация ---
+# Путь к файлу для хранения списка клиентов
+CLIENTS_FILE="/tmp/wifi_clients.txt"
+
+# --- Функции ---
+
+# Функция для отправки сообщения в Telegram
+send_to_telegram() {
+    local message="$1"
+    logger -p local0.info -t dhcp-join-notify "$message"
+
+    # Получаем токен и chat_id из UCI конфигурации
+    local token chat_id
+    token=$(uci -q get telegram-bot.config.bot_token)
+    chat_id=$(uci -q get telegram-bot.config.chat_id)
+
+    # Проверяем, что токен и chat_id не пустые
+    if [ -z "$token" ] || [ -z "$chat_id" ]; then
+        logger -p local0.err -t dhcp-join-notify "Error: Telegram bot_token or chat_id is not set in UCI config 'telegram-bot'."
+        return 1
+    fi
+
+    # Экранирование специальных символов для режима Markdown
+    local escaped_text
+    # Экранируем только базовые символы Markdown: [, *, `, _
+    #escaped_text=$(printf '%s' "$message" | sed 's/[[\*`_]/\\&/g')
+     escaped_text=$message
+
+    # Отправляем сообщение через cURL
+    # Используем -f для возврата ошибки при HTTP 4xx/5xx
+    # Используем -s для тихого режима
+    # Используем -m для таймаута
+    # ВАЖНО: Не логируем вывод curl напрямую во избежание утечки токена
+    if ! curl -sf -m 15 \
+        --data "disable_notification=false" \
+        --data "parse_mode=Markdown" \
+        --data "chat_id=$chat_id" \
+        --data-urlencode "text=$escaped_text" \
+        "https://api.telegram.org/bot${token}/sendMessage" > /dev/null 2>&1; then
+        logger -p local0.err -t dhcp-join-notify "Failed to send message to Telegram (curl error)."
+        return 1
+    fi
+
+    logger -p local0.info -t dhcp-join-notify "Message sent to Telegram successfully."
+}
+
+# Функция для безопасного добавления записи о клиенте в файл
+# Удаляет старую запись с тем же IP адресом перед добавлением новой
+update_clients_file() {
+    local ip="$1"
+    local hostname="$2"
+    local mac="$3"
+    local file="$4"
+
+    # Удаляем строку, начинающуюся с этого IP адреса (если существует)
+    # Экранируем только точку, так как IP содержит только цифры и точки
+    sed -i "/^$(printf '%s' "$ip" | sed 's/\./\\./g') /d" "$file" 2>/dev/null
+
+    # Добавляем новую запись
+    echo "$ip $hostname $mac" >> "$file"
+}
+
+# --- Основная логика скрипта ---
+
+logger -p local0.info -t dhcp-join-notify "WiFi Client Telegram Notification script triggered. Action: ${ACTION:-<not set>}"
+
+# Проверяем, что ACTION равен "add" или "update"
+if [ "$ACTION" = "add" ] || [ "$ACTION" = "update" ]; then
+
+    # Получаем имя устройства (модель), убираем специальные символы для телеграм-тегов
+    device_name=$(sed 's/[^a-zA-Z0-9]//g' /tmp/sysinfo/model 2>/dev/null)
+    # Если не удалось получить, используем заглушку
+    device_name=${device_name:-"UnknownDevice"}
+
+    # === НОВОЕ: Получаем hostname самого роутера ===
+    router_hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null)
+    router_hostname=${router_hostname:-"unknown-host"}
+
+    # Создаем тег для hostname (убираем специальные символы)
+    tag_router_hostname=$(printf '%s' "$router_hostname" | sed 's/[^a-zA-Z0-9]//g')
+    tag_router_hostname=${tag_router_hostname:-"UnknownHost"}
+    # ================================
+
+
+    # Извлекаем последнюю запись DHCPACK из лога dnsmasq
+    new_client=$(logread -e 'dnsmasq-dhcp.*DHCPACK' | tail -n1)
+
+    # Проверяем, что запись найдена
+    if [ -z "$new_client" ]; then
+        logger -p local0.warn -t dhcp-join-notify "No recent DHCPACK entry found in logs."
+        exit 0
+    fi
+
+    # Извлекаем IP, MAC и Hostname с помощью awk
+    ip_address=$(echo "$new_client" | awk '/DHCPACK/ { for(i=1;i<=NF;i++) if($i ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) { print $i; break } }')
+    mac_address=$(echo "$new_client" | awk '/DHCPACK/ { for(i=1;i<=NF;i++) if($i ~ /^[a-fA-F0-9:]{17}$/) { print $i; break } }')
+    # Hostname часто идет последним
+    hostname=$(echo "$new_client" | awk '/DHCPACK/ { print $NF }')
+
+    # Валидация извлеченных данных
+    if [ -z "$ip_address" ]; then
+        logger -p local0.err -t dhcp-join-notify "Failed to parse IP address from DHCPACK log entry."
+        exit 1
+    fi
+
+    if [ -z "$mac_address" ]; then
+        logger -p local0.err -t dhcp-join-notify "Failed to parse MAC address from DHCPACK log entry."
+        exit 1
+    fi
+
+    # Если hostname пустой, не определен или совпадает с IP/MAC, заменяем на NOHOSTNAME
+    case "$hostname" in
+        ""|"$ip_address"|"$mac_address")
+            hostname="NOHOSTNAME"
+            ;;
+    esac
+
+    # Обновляем файл списка клиентов
+    if [ ! -f "$CLIENTS_FILE" ]; then
+        touch "$CLIENTS_FILE" 2>/dev/null
+        if [ $? -ne 0 ]; then
+            logger -p local0.warn -t dhcp-join-notify "Could not create clients file '$CLIENTS_FILE'. Will proceed without it."
+        fi
+    fi
+
+    # Обновляем файл (удаляем старую запись по IP, добавляем новую)
+    if [ -w "$CLIENTS_FILE" ]; then
+        update_clients_file "$ip_address" "$hostname" "$mac_address" "$CLIENTS_FILE"
+    else
+        logger -p local0.warn -t dhcp-join-notify "Clients file '$CLIENTS_FILE' is not writable. Skipping update."
+    fi
+
+    # Логируем локально
+    logger -p local0.info -t dhcp-join-notify "New device JOINED: Hostname='$hostname', IP='$ip_address', MAC='$mac_address'"
+
+    # Формируем сообщение для Telegram
+    # Используем хэштеги, экранируя имя хоста и имя устройства
+    # ИСПРАВЛЕНО: Удалено использование 'local' вне функции
+    tag_hostname=$(printf '%s' "$hostname" | sed 's/[^a-zA-Z0-9]//g')
+    tag_device_name=$(printf '%s' "$device_name" | sed 's/[^a-zA-Z0-9]//g')
+
+    # Если после экранирования хэштег пустой, используем NOHOSTNAME
+    tag_hostname=${tag_hostname:-"NOHOSTNAME"}
+    tag_device_name=${tag_device_name:-"UnknownDevice"}
+
+    telegram_msg="#${tag_hostname} JOINED #${tag_device_name} on #${tag_router_hostname}:
+\`\`\`
+Time: $(date "+%A %d-%b-%Y %T")
+Hostname: ${hostname}
+IP Address: ${ip_address}
+MAC Address: ${mac_address}
+\`\`\`"
+
+    # Отправляем сообщение
+    send_to_telegram "$telegram_msg"
+
+else
+    logger -p local0.debug -t dhcp-join-notify "ACTION is '$ACTION', not 'add' or 'update'. Script exiting."
+fi
+
+exit 0
